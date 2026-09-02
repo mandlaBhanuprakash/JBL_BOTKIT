@@ -1,0 +1,111 @@
+{
+    "server": {
+        "port": 8003
+    },
+    "app": {
+        "apiPrefix" : "",
+        "url": "test_url"
+    },
+    "validations": {
+        "leastNodeVersion": 10
+    },
+    "credentials": {
+        "apikey": "test_api_key",
+        "appId": "test_app_id",
+        "st-67890":{
+            "apikey": "test_api_key2",
+            "appId": "test_app_id2"
+        },
+        "st-73393dc9-b1eb-5bda-a0da-e3faaacd6e8a": {
+            "apikey": "<set KORE_CLIENT_SECRET env var>",
+            "appId": "<set KORE_CLIENT_ID env var>"
+        }
+    },
+    "jwt": {
+        "jwtAlgorithm": "HS256",
+        "jwt-expiry": 60,
+        "st-67890":{
+            "jwtAlgorithm": "HS512",
+            "jwt-expiry": 60
+        }
+    },
+    "redis": {
+        "options": {
+            "host": "localhost",
+            "port": 6379
+        },
+        "available": false
+    },
+    "examples" : {
+        "mockServicesHost"  : "http://localhost:8004"
+    },
+    "liveagentlicense": "8947569",
+    "supportsMessageAck": true,
+    "languages":["en","de"],
+    "salesforce": {
+        "_comment": "Sensitive values are injected from environment variables via config.js. See .env.sample.",
+        "botId": "<set KORE_BOT_ID env var>",
+        "botName": "JBL Assistant",
+        "miaw": {
+            "scrtBaseUrl": "<set SF_SCRT_BASE_URL env var>",
+            "orgId": "<set SF_ORG_ID env var>",
+            "esDeveloperName": "<set SF_ES_DEVELOPER_NAME env var>",
+            "capabilitiesVersion": "1",
+            "platform": "Web"
+        },
+        "oauth": {
+            "enabled": true,
+            "tokenUrl": "<set SF_OAUTH_TOKEN_URL env var>",
+            "clientId": "<set SF_OAUTH_CLIENT_ID env var>",
+            "clientSecret": "<set SF_OAUTH_CLIENT_SECRET env var>",
+            "grantType": "client_credentials",
+            "apiVersion": "v61.0",
+            "transcriptObject": "MessagingSession",
+            "transcriptField": "<Bot_Transcript__c>"
+        },
+        "case": {
+            "_comment": "POST {url} creates the Contact + Case for an existing Messaging Session, and optionally routes it (Kore Create Case RestService v1.0). Auth reuses salesforce.oauth.",
+            "enabled": true,
+            "url": "<set SF_CASE_URL env var, e.g. https://<org>.sandbox.my.salesforce.com/services/apexrest/kore/create-case>",
+            "retry": {
+                "maxAttempts": 3,
+                "delayMs": 4000
+            },
+            "defaults": {
+                "countryCode": "US",
+                "region": "KORE_DEV",
+                "language": "English",
+                "productName": "JBL Flip 6",
+                "orderNumber": "JB-AU-STG10148293"
+            }
+        },
+        "inactivity": {
+            "_comment": "Auto-create a deflected case when a customer stops responding without explicitly ending the chat.",
+            "enabled": true,
+            "timeoutMs": 900000,
+            "nudges": [
+                {
+                    "enabled": false,
+                    "delayMs": 300000,
+                    "message": "Is there anything else I can help you with?"
+                },
+                {
+                    "enabled": true,
+                    "delayMs": 480000,
+                    "message": "We’ll be ending your session soon if there are no further questions or requests. Please let us know if you need any additional assistance."
+                }
+            ]
+            
+        },
+        "agentTransferGraceMs": 10000,
+        "language": "en_US",
+        "routingAttributes": {
+            "Region_Code": "KORE_DEV",
+            "Is_Chat_Button_Clicked": "true",
+            "Bot_Country_Code__c": "US"
+        },
+        "historyLimit": 100,
+        "relayMode": "sse",
+        "webhookSecret": "<shared-secret-if-using-webhook-relay-instead-of-sse>"
+    }
+}
