@@ -75,8 +75,8 @@
                 "countryCode": "US",
                 "region": "KORE_DEV",
                 "language": "English",
-                "productName": "JBL Flip 6",
-                "orderNumber": "JB-AU-STG10148293"
+                "productName": "",
+                "orderNumber": ""
             }
         },
         "inactivity": {
@@ -85,13 +85,13 @@
             "timeoutMs": 900000,
             "nudges": [
                 {
-                    "enabled": false,
+                    "enabled": true,
                     "delayMs": 300000,
-                    "message": "Is there anything else I can help you with?"
+                    "message": "Were you able to get what you needed?"
                 },
                 {
                     "enabled": true,
-                    "delayMs": 480000,
+                    "delayMs": 540000,
                     "message": "We’ll be ending your session soon if there are no further questions or requests. Please let us know if you need any additional assistance."
                 }
             ]

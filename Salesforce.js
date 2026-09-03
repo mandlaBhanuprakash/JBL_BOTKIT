@@ -1172,6 +1172,10 @@ function createDeflectedCase(visitorId, data, deflectionStatus) {
     );
     return Promise.resolve();
   }
+  if (_obhDone[visitorId]) {
+    log("skip deflected case -> OBH case already created for", visitorId);
+    return Promise.resolve();
+  }
   if (!data) {
     log("skip deflected case -> no tracked conversation data for", visitorId);
     return Promise.resolve();
@@ -1191,52 +1195,6 @@ function createDeflectedCase(visitorId, data, deflectionStatus) {
   });
 }
 
-// function pushHistory(visitorId, conversationId, accessToken, messages) {
-//   var lines = _.compact(messages.map(formatHistoryLine));
-//   log("pushHistory:", lines.length, "formatted lines to replay into SF");
-//   if (!lines.length) {
-//     log("pushHistory: nothing to replay");
-//     return Promise.resolve();
-//   }
-
-//   var idx = 0;
-//   var replay = Promise.resolve();
-//   lines.forEach(function (line) {
-//     replay = replay.then(function () {
-//       idx += 1;
-//       var i = idx;
-//       log(
-//         "pushHistory: sending history line",
-//         i + "/" + lines.length,
-//         "->",
-//         line,
-//       );
-//       return api
-//         .sendMessage(accessToken, conversationId, line)
-//         .then(function () {
-//           log("pushHistory: line", i, "delivered");
-//         })
-//         .catch(function (e) {
-//           logErr("pushHistory: line", i, "failed:", e.message);
-//         });
-//     });
-//   });
-
-//   if (SF.oauth && SF.oauth.enabled && SF.oauth.transcriptField) {
-//     replay = replay.then(function () {
-//       log(
-//         "pushHistory: writing transcript blob to field",
-//         SF.oauth.transcriptField,
-//       );
-//       return writeTranscriptBlob(conversationId, lines.join("\n")).catch(
-//         function (e) {
-//           logErr("transcript field write failed:", e.message);
-//         },
-//       );
-//     });
-//   }
-//   return replay;
-// }
 function pushHistory(visitorId, conversationId, accessToken, messages) {
   log("pushHistory:", messages.length, "Kore messages to replay into SF");
   if (!messages.length) {
@@ -1408,7 +1366,6 @@ function handleCustomerEndChat(visitorId, data) {
   disarmInactivityTimer(visitorId);
   if (_obhDone[visitorId]) {
     log("end chat -> OBH case already created, skip for", visitorId);
-    delete _obhDone[visitorId];
     return Promise.resolve();
   }
 
@@ -1446,47 +1403,6 @@ function handleCustomerEndChat(visitorId, data) {
 /* ------------------------------------------------------------------ */
 /* hooks                                                               */
 /* ------------------------------------------------------------------ */
-
-// function onUserMessage(requestId, data, cb) {
-//   var visitorId = getVisitorId(data);
-//   var entry = _map[visitorId];
-//   var liveAgent = entry && entry.routed;
-//   log("attachement::--------", data._originalPayload.channel.attachments,"fileUrl::", data.channel.attachments);
-//   log("attachments-------.... =", jstr(_.get(data, "channel.attachments")));
-
-//   log(
-//     "on_user_message: visitor",
-//     visitorId,
-//     "| liveAgentSession:",
-//     !!liveAgent,
-//     "| message:",
-//     data.message,
-//   );
-//   if (liveAgent) {
-//     userDataMap[visitorId] = data; // refresh for the relay
-//     log(
-//       "forwarding USER message -> Salesforce agent | conv",
-//       entry.conversationId,
-//     );
-//     return api
-//       .sendMessage(entry.accessToken, entry.conversationId, data.message)
-//       .then(function () {
-//         log("user message delivered to agent");
-//       })
-//       .catch(function (e) {
-//         logErr(
-//           "forward to agent failed:",
-//           e.message,
-//           "-> ending session, falling back to bot",
-//         );
-//         endSession(visitorId);
-//         return sdk.sendBotMessage(data, cb);
-//       });
-//   }
-//   noteActivity(visitorId, data);
-//   log("no live agent -> routing message to bot");
-//   return sdk.sendBotMessage(data, cb);
-// }
 
 function onUserMessage(requestId, data, cb) {
   var visitorId = getVisitorId(data);
@@ -1624,7 +1540,11 @@ function onBotMessage(requestId, data, cb) {
   );
 
   // NEW: after-hours form — create Case, then send confirmation
-  if (isObhFormSubmit(data) && !_obhDone[visitorId]) {
+  // Check both in-memory flag AND session flag (survives BotKit restart)
+  var obhAlreadyDone = _obhDone[visitorId] ||
+    _.get(data, "context.session.BotUserSession.caseCreatedMsg");
+
+  if (isObhFormSubmit(data) && !obhAlreadyDone) {
     _obhDone[visitorId] = true;
     return handleObhFormCase(visitorId, data, cb);
   }
