@@ -1490,7 +1490,12 @@ function onUserMessage(requestId, data, cb) {
 
 function handleObhFormCase(visitorId, data, cb) {
   log("OBH form submitted -> creating case for", visitorId);
-  disarmInactivityTimer(visitorId); // do not also fire a deflected case later
+  // Only clear the deflected-case timer, keep nudges running
+  var activityEntry = _activity[visitorId];
+  if (activityEntry) {
+    clearTimeout(activityEntry.timer);
+    activityEntry.timer = null;
+  }
 
   // data.message = "Submitting your case. Please wait...";
   // sdk.sendUserMessage(data, cb);
