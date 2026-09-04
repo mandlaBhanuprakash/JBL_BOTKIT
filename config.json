@@ -76,18 +76,23 @@
                 "region": "KORE_DEV",
                 "language": "English",
                 "productName": "",
-                "orderNumber": ""
+                "orderNumber": "",
+                "subject": "New Case via Kore.AI Chatbot",
+                "description": "Test case created via Kore.AI Chatbot. Please update the subject and description as needed."
             }
         },
         "inactivity": {
             "_comment": "Auto-create a deflected case when a customer stops responding without explicitly ending the chat.",
             "enabled": true,
             "timeoutMs": 900000,
+            "endedReplyMessage": "This conversation has ended. Please start a new chat if you need further help.",
             "nudges": [
                 {
                     "enabled": true,
-                    "delayMs": 300000,
-                    "message": "Were you able to get what you needed?"
+                    "delayMs": 60000,
+                    "message": "Were you able to get what you needed?",
+                    "confirmClosure": true,
+                    "closingMessage": "Thank you! I'm glad I could help. This conversation is now closed."
                 },
                 {
                     "enabled": true,
@@ -95,7 +100,6 @@
                     "message": "We’ll be ending your session soon if there are no further questions or requests. Please let us know if you need any additional assistance."
                 }
             ]
-            
         },
         "agentTransferGraceMs": 10000,
         "language": "en_US",

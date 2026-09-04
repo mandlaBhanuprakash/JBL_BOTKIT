@@ -72,6 +72,16 @@ var INACTIVITY_NUDGES = (_.get(SF, "inactivity.nudges") || []).filter(function (
 // them apart is whether a replacement agent's PARTICIPANT_CHANGED(add)
 // shows up within a short window afterward. See handleSseEvent.
 var AGENT_TRANSFER_GRACE_MS = _.get(SF, "agentTransferGraceMs", 10000);
+// Visitors who confirmed "Yes" on a confirmClosure nudge (see
+// sendInactivityNudge/onUserMessage) -- their conversation is over and must
+// not resume through the bot. Deliberately NOT stored inside _activity[visitorId],
+// since disarmInactivityTimer() deletes that entry as part of normal cleanup.
+var _conversationEnded = {};
+var ENDED_REPLY_MESSAGE = _.get(
+  SF,
+  "inactivity.endedReplyMessage",
+  "This conversation has ended. Please start a new chat if you need further help.",
+);
 
 /* ------------------------------------------------------------------ */
 /* logging helpers                                                     */
@@ -217,6 +227,13 @@ var DEFAULT_DEFLECTION_STATUS = "Assumed Deflection";
  *   - opts.deflectionStatus = session_details.deflection_status, one of
  *     DEFLECTION_STATUSES -- required by Salesforce whenever is_deflected is
  *     true (added 2026-08-26); ignored otherwise.
+ *   - case_details (added 2026-09-04, optional section): origin is always
+ *     sent -- "GenAIChatbot_Agent" for routed sessions, "GenAIChatbot"
+ *     otherwise (any other value 400s, so this is a strict ternary off
+ *     opts.routed, never free text). subject/description are routed-only
+ *     per the spec, sourced from context.caseSubject/caseDescription (a
+ *     dialog can set these) falling back to case.defaults.subject/
+ *     description, truncated to the documented 255/32000-char limits.
  *   - country_code / region come from live context when available, falling
  *     back to config defaults; customer_country_unknown is set whenever we
  *     had to fall back, so Salesforce can see the value wasn't provided.
@@ -266,6 +283,21 @@ function buildCreateCaseBody(data, messagingSessionId, opts) {
     }
     body.session_details.deflection_status = deflectionStatus;
   }
+
+  body.case_details = {
+    origin: opts && opts.routed ? "GenAIChatbot_Agent" : "GenAIChatbot",
+  };
+  if (opts && opts.routed) {
+    var subject = _.get(ctx, "caseSubject") || defaults.subject;
+    var description = _.get(ctx, "caseDescription") || defaults.description;
+    if (subject) {
+      body.case_details.subject = String(subject).slice(0, 255);
+    }
+    if (description) {
+      body.case_details.description = String(description).slice(0, 32000);
+    }
+  }
+
   return _.merge({}, body, _.get(ctx, "salesforceCase"));
 }
 
@@ -1269,6 +1301,35 @@ function clearNudgeTimers(entry) {
   entry.nudgeTimers.forEach(clearTimeout);
   entry.nudgeTimers = [];
 }
+
+/**
+ * buildYesNoTemplate
+ * Kore quick-reply "button" template (confirmed schema, per Kore.ai SDK
+ * docs: {type:"template", payload:{template_type:"button", buttons:[
+ * {type:"postback", title, payload}]}}) -- this exact template_type is
+ * already known to render in the live widget (the bot's own dialog history
+ * already uses template_type:"button" for a URL button). NOT confirmed:
+ * whether a postback button's "title" or its "payload" is what actually
+ * reaches on_user_message on click -- Kore's docs don't say. Worked around
+ * by setting both to the same value, so detection matches regardless.
+ */
+function buildYesNoTemplate(message) {
+  return {
+    isTemplate: true,
+    body: JSON.stringify({
+      type: "template",
+      payload: {
+        template_type: "button",
+        text: message,
+        buttons: [
+          { type: "postback", title: "Yes", payload: "Yes" },
+          { type: "postback", title: "No", payload: "No" },
+        ],
+      },
+    }),
+  };
+}
+
 function sendInactivityNudge(visitorId, nudge, stepKey) {
   var entry = _activity[visitorId];
   if (!entry || !entry.data) {
@@ -1284,14 +1345,25 @@ function sendInactivityNudge(visitorId, nudge, stepKey) {
   entry.sentNudges[stepKey] = true;
   var payload = _.assign({}, entry.data);
   payload.message = nudge.message;
+  if (nudge.confirmClosure) {
+    payload.overrideMessagePayload = buildYesNoTemplate(nudge.message);
+    // Remember which nudge is pending confirmation so onUserMessage knows
+    // to intercept the reply instead of routing it to the bot, and so it
+    // can read nudge.closingMessage once the customer confirms.
+    entry.awaitingConfirmClosure = nudge;
+  }
   log(
     "inactivity nudge (" + nudge.delayMs + "ms / " + stepKey + ") ->",
     visitorId,
+    nudge.confirmClosure ? "| with Yes/No confirmation" : "",
   );
   sdk.sendUserMessage(payload, function (err) {
     if (err) {
       logErr("inactivity nudge failed:", stepKey, jstr(err));
       entry.sentNudges[stepKey] = false;
+      if (nudge.confirmClosure) {
+        entry.awaitingConfirmClosure = null;
+      }
     }
   });
 }
@@ -1307,6 +1379,11 @@ function noteActivity(visitorId, data) {
   var entry = _activity[visitorId] || {};
   entry.data = data;
   entry.sentNudges = {};
+  // A fresh activity cycle invalidates any confirmClosure nudge still
+  // awaiting a reply from a previous cycle -- otherwise a customer typing
+  // literal "yes" as an unrelated later message could be misread as
+  // confirming closure long after the prompt that asked for it.
+  entry.awaitingConfirmClosure = null;
   clearTimeout(entry.timer);
   clearNudgeTimers(entry);
   entry.nudgeTimers = INACTIVITY_NUDGES.map(function (nudge, i) {
@@ -1406,6 +1483,17 @@ function handleCustomerEndChat(visitorId, data) {
 
 function onUserMessage(requestId, data, cb) {
   var visitorId = getVisitorId(data);
+
+  if (_conversationEnded[visitorId]) {
+    log(
+      "on_user_message: visitor",
+      visitorId,
+      "-> conversation already ended (confirmed Successful Deflection), not resuming bot",
+    );
+    data.message = ENDED_REPLY_MESSAGE;
+    return sdk.sendUserMessage(data, cb);
+  }
+
   var entry = _map[visitorId];
   var liveAgent = entry && entry.routed;
   var files = attachments.fromPayload(data);
@@ -1466,6 +1554,41 @@ function onUserMessage(requestId, data, cb) {
       });
   }
 
+  // Reply to a pending confirmClosure nudge (see sendInactivityNudge)?
+  // "Yes" ends the conversation for good -- creates the Successful
+  // Deflection case and blocks the bot from ever responding to this
+  // visitor again (see _conversationEnded above). Anything else ("No" or
+  // otherwise) just clears the pending flag and falls through to normal
+  // bot handling below, same as any other message.
+  var activityEntry = _activity[visitorId];
+  var pendingNudge = activityEntry && activityEntry.awaitingConfirmClosure;
+  if (pendingNudge) {
+    activityEntry.awaitingConfirmClosure = null;
+    var reply = String(data.message || "").trim().toLowerCase();
+    if (reply === "yes") {
+      log(
+        "on_user_message: visitor",
+        visitorId,
+        "confirmed no further help needed -> Successful Deflection, ending conversation",
+      );
+      _conversationEnded[visitorId] = true;
+      disarmInactivityTimer(visitorId);
+      createDeflectedCase(visitorId, data, "Successful Deflection");
+      data.message =
+        pendingNudge.closingMessage ||
+        "Thank you! I'm glad I could help. This conversation is now closed.";
+      delete data.overrideMessagePayload;
+      return sdk.sendUserMessage(data, cb);
+    }
+    log(
+      "on_user_message: visitor",
+      visitorId,
+      "did not confirm closure (reply:",
+      jstr(data.message),
+      ") -> continuing bot flow",
+    );
+  }
+
   noteActivity(visitorId, data);
 
   // File-only event: message is undefined. sendBotMessage of that
@@ -1490,12 +1613,12 @@ function onUserMessage(requestId, data, cb) {
 
 function handleObhFormCase(visitorId, data, cb) {
   log("OBH form submitted -> creating case for", visitorId);
-  // Only clear the deflected-case timer, keep nudges running
-  var activityEntry = _activity[visitorId];
-  if (activityEntry) {
-    clearTimeout(activityEntry.timer);
-    activityEntry.timer = null;
-  }
+// Only clear the deflected-case timer, keep nudges running
+var activityEntry = _activity[visitorId];
+if (activityEntry) {
+  clearTimeout(activityEntry.timer);
+  activityEntry.timer = null;
+}
 
   // data.message = "Submitting your case. Please wait...";
   // sdk.sendUserMessage(data, cb);
