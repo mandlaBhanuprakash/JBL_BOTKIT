@@ -267,6 +267,60 @@ SSE: CLOSE/CONVERSATION_CLOSED    ─► end session, clearAgentSessionSafe
   `DEFAULT_DEFLECTION_STATUS` (`"Assumed Deflection"`) if a future call site
   forgets to pass one, rather than omitting the field and hitting this
   error again.
+- **`case_details` section added to the Kore Create Case body (2026-09-04),
+  optional/backward-compatible.** `origin` must be exactly `"GenAIChatbot"`
+  or `"GenAIChatbot_Agent"` (anything else 400s) — always sent, computed
+  directly from `opts.routed` (never free text, so no validation-list check
+  needed unlike `deflection_status`). `subject` (max 255 chars) /
+  `description` (max 32000 chars) are **routed sessions only** per
+  Salesforce's spec — `buildCreateCaseBody()` only adds them when
+  `opts.routed` is true, sourced from `context.caseSubject`/
+  `context.caseDescription` (dialog-settable, not currently set by any
+  dialog node) falling back to `salesforce.case.defaults.subject`/
+  `description` (both empty by default), truncated defensively to the
+  documented limits before sending.
+- **Inactivity nudges (`salesforce.inactivity.nudges`, an array) and the
+  Yes/No confirm-closure flow (added 2026-09-04).** Each nudge fires a
+  `setTimeout` from the visitor's last activity (`noteActivity()`/
+  `sendInactivityNudge()`); independent of the final `timeoutMs` "Assumed
+  Deflection" cutoff. A nudge with `confirmClosure: true` (currently only
+  the "Were you able to get what you needed?" nudge, at 1 min) sends a Kore
+  quick-reply **button** template instead of plain text
+  (`buildYesNoTemplate()` — `template_type: "button"`, confirmed schema per
+  Kore.ai SDK docs and already known to render in this widget since the
+  bot's own dialog history already uses the same `template_type` for a URL
+  button) with "Yes"/"No" postback buttons, and records
+  `_activity[visitorId].awaitingConfirmClosure = nudge`.
+  - **Not confirmed**: whether a postback button's `title` or its `payload`
+    is what Kore actually forwards to `on_user_message` on click — Kore's
+    docs don't say. Worked around by setting both to `"Yes"`/`"No"`, so
+    detection (`onUserMessage`, case-insensitive match) works either way.
+    Verify with a live click before trusting this fully.
+  - Customer replies "Yes" → `_conversationEnded[visitorId] = true` is set
+    **permanently** (not on a timer, not cleared by `disarmInactivityTimer`
+    — deliberately kept in a separate map so normal session cleanup doesn't
+    wipe it), a `"Successful Deflection"` case is created immediately, and
+    **every subsequent message from that visitor** gets `ENDED_REPLY_MESSAGE`
+    instead of ever reaching the bot again (checked at the very top of
+    `onUserMessage`, before anything else). There is currently no
+    expiry/reset for `_conversationEnded` — if the same `visitorId` returns
+    to chat again far in the future (a real customer, not just the same
+    browser tab), they will still be locked out. This hasn't come up yet;
+    revisit if it does (e.g. clear it on a genuine new `ON_CONNECT_EVENT`,
+    or add a TTL).
+  - Any other reply ("No" or otherwise, updated 2026-09-06) clears
+    `awaitingConfirmClosure` and is **acknowledged directly, NOT forwarded
+    to the bot for that turn** — replies with `nudge.continueMessage`
+    (default: `"Let me know if you have any other queries"`) instead. The
+    customer's *next* message after that goes to the bot normally. Note
+    this swallows the reply verbatim regardless of what it actually says —
+    if the customer ignores the buttons and types a real, different
+    question instead of clicking "No", that question currently gets
+    replaced with the canned acknowledgment rather than answered; only
+    their *following* message reaches the bot. `noteActivity()` still
+    clears this flag on every fresh activity cycle, so a stale pending
+    confirmation from an old nudge can never be misread against an
+    unrelated later message that happens to say "yes".
 - **`messaging_session_id` for the Kore Create Case endpoint is a real
   Salesforce record Id (e.g. `0MwV900000EL6f3`, `0Mw` = `MessagingSession`
   prefix) — it is NOT the `conversationId` UUID we generate for MIAW's

@@ -911,6 +911,37 @@ function handleSseEvent(visitorId, block) {
       }
     });
   } else if (
+    /SESSION_STATUS_CHANGED/i.test(eventName) ||
+    /SessionStatusChanged/i.test(entryType)
+  ) {
+    var status = String(ep.sessionStatus || "").toUpperCase();
+    var endedBy = String(ep.sessionEndedByRole || "").toLowerCase();
+    log(
+      "SSE: session status ->",
+      status,
+      "| endedBy:",
+      endedBy || "(none)",
+      "| visitor",
+      visitorId,
+    );
+
+    if (status !== "ENDED") {
+      return;
+    }
+
+    delete data.overrideMessagePayload;
+    data.message = "The agent has ended the chat. This conversation is now closed.";
+    _.set(data, "_originalPayload.message", data.message);
+
+    sdk.sendUserMessage(data, function (err) {
+      if (err) {
+        logErr("sendUserMessage (session ended) failed:", jstr(err));
+      }
+    });
+
+    finishLiveAgentHandoff(visitorId, data, "agent-ended-chat");
+
+  } else if (
     /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
     /ConversationEnded|CloseConversation/i.test(entryType)
   ) {
@@ -918,8 +949,7 @@ function handleSseEvent(visitorId, block) {
       "SSE: conversation closed by Salesforce -> ending session for",
       visitorId,
     );
-    endSession(visitorId);
-    clearAgentSessionSafe(visitorId, data);
+    finishLiveAgentHandoff(visitorId, data, "sse-close-conversation");
   }
 }
 
@@ -968,6 +998,48 @@ function clearAgentSessionSafe(visitorId, data) {
     });
   });
 }
+//-----------------
+function closeWebSdkSession(data) {
+  if (!data || !data.clearConversationSessionUrl) {
+    log("closeWebSdkSession skipped (no clearConversationSessionUrl)");
+    return Promise.resolve();
+  }
+  return new Promise(function (resolve) {
+    try {
+      sdk.closeConversationSession(data, function (err) {
+        if (err) {
+          logErr("closeConversationSession failed:", jstr(err));
+        } else {
+          log("closeConversationSession OK");
+        }
+        resolve();
+      });
+    } catch (e) {
+      logErr("closeConversationSession threw:", e.message);
+      resolve();
+    }
+  });
+}
+
+function finishLiveAgentHandoff(visitorId, data, reason) {
+  var entry = _map[visitorId];
+  var payload = data || userDataMap[visitorId];
+  if (!entry) {
+    log("finishLiveAgentHandoff skip:", reason, visitorId);
+    return Promise.resolve();
+  }
+  log("finishLiveAgentHandoff:", reason, visitorId);
+  _conversationEnded[visitorId] = true;
+  endSession(visitorId);
+  return Promise.resolve()
+    .then(function () {
+      return payload ? clearAgentSessionSafe(visitorId, payload) : null;
+    })
+    .then(function () {
+      return closeWebSdkSession(payload);
+    });
+}
+
 
 /* ------------------------------------------------------------------ */
 /* handoff                                                             */
@@ -1558,8 +1630,10 @@ function onUserMessage(requestId, data, cb) {
   // "Yes" ends the conversation for good -- creates the Successful
   // Deflection case and blocks the bot from ever responding to this
   // visitor again (see _conversationEnded above). Anything else ("No" or
-  // otherwise) just clears the pending flag and falls through to normal
-  // bot handling below, same as any other message.
+  // otherwise) is acknowledged directly -- NOT forwarded to the bot for
+  // this turn -- so the customer isn't left mid-answer to a yes/no prompt
+  // the bot never asked. Their next message after this one goes to the
+  // bot normally, same as any other message.
   var activityEntry = _activity[visitorId];
   var pendingNudge = activityEntry && activityEntry.awaitingConfirmClosure;
   if (pendingNudge) {
@@ -1585,8 +1659,14 @@ function onUserMessage(requestId, data, cb) {
       visitorId,
       "did not confirm closure (reply:",
       jstr(data.message),
-      ") -> continuing bot flow",
+      ") -> acknowledging, not forwarding this message to bot",
     );
+    noteActivity(visitorId, data);
+    data.message =
+      pendingNudge.continueMessage ||
+      "Let me know if you have any other queries";
+    delete data.overrideMessagePayload;
+    return sdk.sendUserMessage(data, cb);
   }
 
   noteActivity(visitorId, data);
@@ -1613,12 +1693,12 @@ function onUserMessage(requestId, data, cb) {
 
 function handleObhFormCase(visitorId, data, cb) {
   log("OBH form submitted -> creating case for", visitorId);
-// Only clear the deflected-case timer, keep nudges running
-var activityEntry = _activity[visitorId];
-if (activityEntry) {
-  clearTimeout(activityEntry.timer);
-  activityEntry.timer = null;
-}
+  // Only clear the deflected-case timer, keep nudges running
+  var activityEntry = _activity[visitorId];
+  if (activityEntry) {
+    clearTimeout(activityEntry.timer);
+    activityEntry.timer = null;
+  }
 
   // data.message = "Submitting your case. Please wait...";
   // sdk.sendUserMessage(data, cb);
@@ -1717,7 +1797,14 @@ function onEvent(requestId, data, cb) {
     eventType === "sessionClosure" ||
     resourceId === "/bot.closeConversationSession"
   ) {
-    log("Customer end chat detected:", visitorId);
+
+    var liveAgent = _map[visitorId] && _map[visitorId].routed;
+    if (!liveAgent) {
+      log("sessionClosure ignored (no live agent) for", visitorId);
+      return cb(null, data);
+    }
+    log("Customer end chat with live agent -> closing Salesforce session", visitorId);
+    
 
     handleCustomerEndChat(visitorId, data).catch(function (e) {
       logErr("handleCustomerEndChat failed:", (e && e.message) || e);
