@@ -931,7 +931,7 @@ function handleSseEvent(visitorId, block) {
 
     delete data.overrideMessagePayload;
     data.message = "The agent has ended the chat. This conversation is now closed.";
-    
+
     _.set(data, "_originalPayload.message", data.message);
 
     sdk.sendUserMessage(data, function (err) {
@@ -940,7 +940,6 @@ function handleSseEvent(visitorId, block) {
       }
     });
     _conversationEnded[visitorId] = true;
-
     finishLiveAgentHandoff(visitorId, data, "agent-ended-chat");
 
   } else if (
@@ -1458,6 +1457,13 @@ function noteActivity(visitorId, data) {
   // literal "yes" as an unrelated later message could be misread as
   // confirming closure long after the prompt that asked for it.
   entry.awaitingConfirmClosure = null;
+  // Same reasoning: real activity means the "went silent after clicking No"
+  // window (see armPostNoDeflectionTimer) no longer applies -- back to the
+  // standard nudge/timeout cycle below instead.
+  if (entry.postNoTimer) {
+    clearTimeout(entry.postNoTimer);
+    entry.postNoTimer = null;
+  }
   clearTimeout(entry.timer);
   clearNudgeTimers(entry);
   entry.nudgeTimers = INACTIVITY_NUDGES.map(function (nudge, i) {
@@ -1485,9 +1491,47 @@ function disarmInactivityTimer(visitorId) {
   if (entry) {
     clearTimeout(entry.timer);
     clearNudgeTimers(entry);
+    clearTimeout(entry.postNoTimer);
   }
   delete _activity[visitorId];
 
+}
+
+/**
+ * armPostNoDeflectionTimer
+ * Customer explicitly said "No" (the bot didn't help) on a confirmClosure
+ * nudge. Instead of the standard nudge/timeout cycle, wait
+ * nudge.noResponseTimeoutMs for them to say anything else; if nothing
+ * arrives, log a "Not deflected" case (bot-handled, but unsuccessfully --
+ * distinct from "Assumed Deflection", where we never got a negative signal
+ * at all). Does NOT set _conversationEnded -- unlike a "Yes"/Successful
+ * Deflection, the issue is explicitly unresolved, so the bot should still
+ * be willing to help if the customer comes back and says more.
+ */
+function armPostNoDeflectionTimer(visitorId, data, nudge) {
+  disarmInactivityTimer(visitorId);
+  var delayMs = nudge.noResponseTimeoutMs;
+  var status = nudge.noResponseDeflectionStatus || "Not deflected";
+  // postNoDeflectionStatus is stored on the entry (not just closed over by
+  // the timeout below) so handleCustomerEndChat can read it if the customer
+  // explicitly closes the chat before this timer fires -- an explicit close
+  // during this window is the same outcome as going silent, so it should
+  // get the same status instead of the generic "Assumed Deflection".
+  var entry = { data: data, postNoDeflectionStatus: status };
+  entry.postNoTimer = setTimeout(function () {
+    if (_activity[visitorId] !== entry) {
+      return; // superseded by newer activity or cleanup in the meantime
+    }
+    log(
+      "no further response",
+      delayMs + "ms after 'No' -> creating",
+      jstr(status),
+      "case for",
+      visitorId,
+    );
+    createDeflectedCase(visitorId, entry.data, status);
+  }, delayMs);
+  _activity[visitorId] = entry;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1514,6 +1558,35 @@ function disarmInactivityTimer(visitorId) {
 function handleCustomerEndChat(visitorId, data) {
   log("handleCustomerEndChat for visitor", visitorId);
 
+  // Kore/the widget can fire a second sessionClosure on its own after we've
+  // already fully closed things out (observed: our closing message is
+  // followed by Kore's own native "This conversation has been closed..."
+  // message, which fires its own sessionClosure). Without this guard, that
+  // duplicate signal falls into the no-live-agent branch below (since
+  // endSession already cleared _map) and creates a second, spuriously
+  // "Assumed Deflection" case on top of the correct one just created by
+  // the "Yes" confirmation.
+  if (_conversationEnded[visitorId]) {
+    log(
+      "visitor",
+      visitorId,
+      "conversation already ended -> ignoring duplicate end-chat signal",
+    );
+    return Promise.resolve();
+  }
+
+  // If the customer already said "No" to a confirmClosure nudge and is
+  // explicitly closing the chat before the post-No silence window elapsed
+  // (armPostNoDeflectionTimer), treat it the same as if they'd gone silent
+  // -- use that nudge's noResponseDeflectionStatus (e.g. "Not deflected")
+  // instead of the generic status below. We have a more specific signal
+  // here (they told us the bot didn't help) than a plain end-chat/timeout.
+  var pendingActivity = _activity[visitorId];
+  var postNoStatus =
+    pendingActivity && pendingActivity.postNoTimer
+      ? pendingActivity.postNoDeflectionStatus
+      : null;
+
   disarmInactivityTimer(visitorId);
   if (_obhDone[visitorId]) {
     log("end chat -> OBH case already created, skip for", visitorId);
@@ -1522,8 +1595,16 @@ function handleCustomerEndChat(visitorId, data) {
 
   var entry = _map[visitorId];
   if (!entry || !entry.routed) {
-    log("no live agent session -> treating as deflected case for", visitorId);
-    return createDeflectedCase(visitorId, data, "Successful Deflection");
+    log(
+      "no live agent session -> treating as deflected case for",
+      visitorId,
+      postNoStatus ? "| pending post-No window -> " + postNoStatus : "",
+    );
+    return createDeflectedCase(
+      visitorId,
+      data,
+      postNoStatus || "Assumed Deflection",
+    );
   }
 
   log(
@@ -1663,7 +1744,11 @@ function onUserMessage(requestId, data, cb) {
       jstr(data.message),
       ") -> acknowledging, not forwarding this message to bot",
     );
-    noteActivity(visitorId, data);
+    if (pendingNudge.noResponseTimeoutMs > 0) {
+      armPostNoDeflectionTimer(visitorId, data, pendingNudge);
+    } else {
+      noteActivity(visitorId, data);
+    }
     data.message =
       pendingNudge.continueMessage ||
       "Let me know if you have any other queries";
@@ -1780,39 +1865,101 @@ function onAgentTransfer(requestId, data, cb) {
  * for other client disconnects (not just an explicit end-chat click), this
  * will need narrowing -- see CLAUDE.md.
  */
-function onEvent(requestId, data, cb) {
-  var visitorId = getVisitorId(data);
-  var eventType = _.get(data, "event.eventType");
-  var resourceId = _.get(data, "resourceid");
+// function onEvent(requestId, data, cb) {
+//   var visitorId = getVisitorId(data);
+//   var eventType = _.get(data, "event.eventType");
+//   var resourceId = _.get(data, "resourceid");
 
+//   log(
+//     "on_event:",
+//     "visitor=",
+//     visitorId,
+//     "| eventType=",
+//     eventType,
+//     "| resourceid=",
+//     resourceId,
+//   );
+
+//   if (
+//     eventType === "sessionClosure" ||
+//     resourceId === "/bot.closeConversationSession"
+//   ) {
+
+//     var liveAgent = _map[visitorId] && _map[visitorId].routed;
+//     if (!liveAgent) {
+//       log("sessionClosure ignored (no live agent) for", visitorId);
+//       return cb(null, data);
+//     }
+//     log("Customer end chat with live agent -> closing Salesforce session", visitorId);
+
+
+//     handleCustomerEndChat(visitorId, data).catch(function (e) {
+//       logErr("handleCustomerEndChat failed:", (e && e.message) || e);
+//     });
+//   }
+
+//   return cb(null, data);
+// }
+//------------------------------------------------------------------ */
+function resolveVisitorId(data) {
+  var id =
+    getVisitorId(data) ||
+    _.get(data, "_originalPayload.channel.channelInfos.from") ||
+    _.get(data, "_originalPayload.channel.from") ||
+    _.get(data, "from") ||
+    data.userId;
+  if (id) {
+    return id;
+  }
+  var routedIds = Object.keys(_map).filter(function (k) {
+    return _map[k] && _map[k].routed;
+  });
+  if (routedIds.length === 1) {
+    log("sessionClosure had no channel.from -> using sole live agent visitor", routedIds[0]);
+    return routedIds[0];
+  }
+  log(
+    "sessionClosure visitor unresolved | channel=",
+    jstr(data.channel),
+    "| _map keys=",
+    Object.keys(_map),
+  );
+  return null;
+}
+
+function onEvent(requestId, data, cb) {
+  var visitorId = resolveVisitorId(data);
+  var eventType = _.get(data, "event.eventType");
+  var resourceId =
+    _.get(data, "resourceid") ||
+    _.get(data, "_originalPayload.resourceid");
   log(
     "on_event:",
-    "visitor=",
-    visitorId,
-    "| eventType=",
-    eventType,
-    "| resourceid=",
-    resourceId,
+    "visitor=", visitorId,
+    "| eventType=", eventType,
+    "| resourceid=", resourceId,
+    "| event=", jstr(data.event),
   );
-
   if (
     eventType === "sessionClosure" ||
-    resourceId === "/bot.closeConversationSession"
+    /closeConversationSession/i.test(String(resourceId || ""))
   ) {
-
-    var liveAgent = _map[visitorId] && _map[visitorId].routed;
+    var entry = visitorId && _map[visitorId];
+    var liveAgent = entry && entry.routed;
     if (!liveAgent) {
-      log("sessionClosure ignored (no live agent) for", visitorId);
+      log(
+        "sessionClosure ignored (no live agent) for",
+        visitorId,
+        "| routed map=",
+        Object.keys(_map).filter(function (k) { return _map[k] && _map[k].routed; }),
+      );
       return cb(null, data);
     }
     log("Customer end chat with live agent -> closing Salesforce session", visitorId);
-
-
     handleCustomerEndChat(visitorId, data).catch(function (e) {
       logErr("handleCustomerEndChat failed:", (e && e.message) || e);
     });
   }
-
   return cb(null, data);
 }
 
