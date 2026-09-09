@@ -931,6 +931,7 @@ function handleSseEvent(visitorId, block) {
 
     delete data.overrideMessagePayload;
     data.message = "The agent has ended the chat. This conversation is now closed.";
+    
     _.set(data, "_originalPayload.message", data.message);
 
     sdk.sendUserMessage(data, function (err) {
@@ -938,6 +939,7 @@ function handleSseEvent(visitorId, block) {
         logErr("sendUserMessage (session ended) failed:", jstr(err));
       }
     });
+    _conversationEnded[visitorId] = true;
 
     finishLiveAgentHandoff(visitorId, data, "agent-ended-chat");
 
@@ -1804,7 +1806,7 @@ function onEvent(requestId, data, cb) {
       return cb(null, data);
     }
     log("Customer end chat with live agent -> closing Salesforce session", visitorId);
-    
+
 
     handleCustomerEndChat(visitorId, data).catch(function (e) {
       logErr("handleCustomerEndChat failed:", (e && e.message) || e);
