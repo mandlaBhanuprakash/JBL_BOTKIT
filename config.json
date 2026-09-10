@@ -83,7 +83,7 @@
         },
         "inactivity": {
             "_comment": "Auto-create a deflected case when a customer stops responding without explicitly ending the chat.",
-            "enabled": true,
+            "enabled": false,
             "timeoutMs": 900000,
             "endedReplyMessage": "This conversation has ended. Please start a new chat if you need further help.",
             "nudges": [
@@ -93,7 +93,9 @@
                     "message": "Were you able to get what you needed?",
                     "confirmClosure": true,
                     "closingMessage": "Thank you! I'm glad I could help. This conversation is now closed.",
-                    "continueMessage": "Let me know if you have any other queries"
+                    "continueMessage": "Let me know if you have any other queries",
+                    "noResponseTimeoutMs": 600000,
+                    "noResponseDeflectionStatus": "Not deflected"
                 },
                 {
                     "enabled": true,

@@ -494,6 +494,21 @@ function formatHistoryLine(m) {
 /* agent -> user relay (SSE)                                           */
 /* ------------------------------------------------------------------ */
 
+function scheduleSseReconnect(visitorId) {
+  var entry = _map[visitorId];
+  if (!entry || !entry.routed) return;
+  if (entry.endingByCustomer || _conversationEnded[visitorId]) return;
+  if (entry.sseReconnectTimer) return;
+
+  entry.sseReconnectTimer = setTimeout(function () {
+    entry.sseReconnectTimer = null;
+    if (!_map[visitorId] || !_map[visitorId].routed) return;
+    if (_conversationEnded[visitorId]) return;
+    log("SSE: reconnecting", visitorId, "| lastEventId", entry.lastEventId);
+    startSseRelay(visitorId);
+  }, 2000);
+}
+
 function startSseRelay(visitorId) {
   var entry = _map[visitorId];
   if (!entry) {
@@ -540,18 +555,140 @@ function startSseRelay(visitorId) {
       });
       res.on("end", function () {
         log("SSE: stream ended for visitor", visitorId);
+        scheduleSseReconnect(visitorId);
       });
     },
   );
   req.on("error", function (e) {
     logErr("SSE error for", visitorId, ":", e.message);
+    scheduleSseReconnect(visitorId);
   });
   req.end();
 
   entry.sse = req;
 }
 
+function sendParticipantLine(data, text) {
+  return new Promise(function (resolve) {
+    delete data.overrideMessagePayload;
+    delete data.metaTags;
+    data.message = text;
+    _.set(data, "_originalPayload.message", text);
+    sdk.sendUserMessage(data, function (err) {
+      if (err) logErr("sendUserMessage (participant-change) failed:", jstr(err));
+      resolve();
+    });
+  });
+}
 
+function cancelPendingAgentEnd(entry) {
+  if (entry.pendingLeaveTimer) {
+    clearTimeout(entry.pendingLeaveTimer);
+    entry.pendingLeaveTimer = null;
+  }
+}
+
+function cancelPendingJoinWait(entry) {
+  if (entry.pendingJoinTimer) {
+    clearTimeout(entry.pendingJoinTimer);
+    entry.pendingJoinTimer = null;
+  }
+}
+
+function armPendingAgentEnd(visitorId, data, entry, reason) {
+  if (entry.pendingLeaveTimer) return;
+  log("SSE: pending agent-end (", reason, ") wait", AGENT_TRANSFER_GRACE_MS, "ms", visitorId);
+  entry.pendingLeaveTimer = setTimeout(function () {
+    if (_map[visitorId] !== entry) return;
+    if (entry.endingByCustomer || _conversationEnded[visitorId]) return;
+    entry.pendingLeaveTimer = null;
+    entry.pendingJoinName = null;
+    cancelPendingJoinWait(entry);
+    log("SSE: no replacement agent -> confirmed hang-up", visitorId, "|", reason);
+    sendAgentEnded(data, visitorId, entry);
+  }, AGENT_TRANSFER_GRACE_MS);
+}
+
+function enqueueNotices(data, entry, lines) {
+  entry.noticeChain = (entry.noticeChain || Promise.resolve()).then(function () {
+    var work = Promise.resolve();
+    lines.forEach(function (text) {
+      work = work.then(function () {
+        return sendParticipantLine(data, text);
+      });
+    });
+    return work;
+  });
+  return entry.noticeChain;
+}
+
+function flushParticipantNotices(visitorId, data, entry) {
+  var leftName = entry.pendingLeaveName;
+  var joinName = entry.pendingJoinName;
+
+  // L2 add arrived before L1 remove: wait briefly so we can send left THEN join.
+  if (joinName && !leftName && entry.agentName && entry.agentName !== joinName) {
+    if (!entry.pendingJoinTimer) {
+      entry.pendingJoinTimer = setTimeout(function () {
+        entry.pendingJoinTimer = null;
+        if (_map[visitorId] !== entry) return;
+        flushParticipantNotices(visitorId, data, entry);
+      }, 800);
+    }
+    return;
+  }
+  cancelPendingJoinWait(entry);
+
+  if (leftName && joinName) {
+    entry.pendingLeaveName = null;
+    entry.pendingJoinName = null;
+    cancelPendingAgentEnd(entry);
+    entry.agentName = joinName;
+    log("SSE: L1->L2 notices in order", leftName, "->", joinName, visitorId);
+    enqueueNotices(data, entry, [
+      leftName + " has left the conversation.",
+      joinName + " has joined the conversation.",
+    ]);
+    return;
+  }
+
+  if (joinName && !leftName) {
+    entry.pendingJoinName = null;
+    entry.agentName = joinName;
+    enqueueNotices(data, entry, [joinName + " has joined the conversation."]);
+  }
+}
+
+
+
+function sendAgentEnded(data, visitorId, entry) {
+  cancelPendingJoinWait(entry);
+  entry.pendingJoinName = null;
+  if (entry.pendingLeaveTimer) {
+    clearTimeout(entry.pendingLeaveTimer);
+    entry.pendingLeaveTimer = null;
+  }
+  entry.pendingLeaveName = null;
+
+  data.message =
+    "The agent has ended the chat. This conversation is now closed.";
+  data.overrideMessagePayload = {
+    isTemplate: true,
+    body: JSON.stringify({
+      type: "template",
+      payload: {
+        template_type: "custom",
+        custom_type: "agent_session_ended",
+        text: data.message,
+      },
+    }),
+  };
+  sdk.sendUserMessage(data, function (err) {
+    if (err) logErr("sendUserMessage (session ended) failed:", jstr(err));
+  });
+  _conversationEnded[visitorId] = true;
+  finishLiveAgentHandoff(visitorId, data, "agent-ended-chat");
+}
 
 function handleSseEvent(visitorId, block) {
   var entry = _map[visitorId];
@@ -612,6 +749,21 @@ function handleSseEvent(visitorId, block) {
   var senderRole =
     _.get(entry2, "sender.role") || _.get(payload, "sender.role") || "";
   var entryType = ep.entryType || entry2.entryType || "";
+
+  var alreadyEnded = !!(entry.endingByCustomer || _conversationEnded[visitorId]);
+  if (alreadyEnded) {
+    if (
+      /SESSION_STATUS_CHANGED/i.test(eventName) ||
+      /SessionStatusChanged/i.test(entryType) ||
+      /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
+      /ConversationEnded|CloseConversation/i.test(entryType)
+    ) {
+      finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
+    } else {
+      log("SSE after customer end -> skip", eventName, visitorId);
+    }
+    return;
+  }
 
   // ---------------------------------------------------------------
   // AGENT TYPING STARTED
@@ -791,166 +943,95 @@ function handleSseEvent(visitorId, block) {
         logErr("forward agent file(s) failed:", e.message);
       });
     }
-
     if (!text && !files.length) {
       log("SSE: message event had no text or files. parsed entryPayload =", jstr(ep));
     }
-  } else if (
-    /PARTICIPANT_CHANGED/i.test(eventName) ||
-    /ParticipantChanged/i.test(entryType)
-  ) {
+    return;
+  }
+
+  if (/SESSION_OWNER_CHANGED/i.test(eventName) || /SessionOwnerChanged/i.test(entryType)) {
+    log("SSE: owner", ep.prevOwnerType, "->", ep.newOwnerType, "| status", ep.sessionStatus, visitorId);
+    if (/agent/i.test(String(ep.newOwnerType || ""))) {
+      cancelPendingAgentEnd(entry);
+    }
+    return;
+  }
+
+  if (/ROUTING_WORK_RESULT/i.test(eventName) || /RoutingWorkResult/i.test(entryType)) {
+    log("SSE: routing workType", ep.workType, visitorId);
+    cancelPendingAgentEnd(entry);
+    return;
+  }
+
+  if (/PARTICIPANT_CHANGED/i.test(eventName) || /ParticipantChanged/i.test(entryType)) {
     var participants = _.isArray(ep.entries) ? ep.entries : [ep];
+    var sawAgentAdd = false;
+    var sawAgentRemove = false;
 
     participants.forEach(function (p) {
       var role =
         _.get(p, "participant.role") || p.role || _.get(p, "sender.role") || "";
-
-      if (!/agent/i.test(role)) {
-        log(
-          "SSE: participant change ignored (role=" + role + ") | raw:",
-          jstr(p),
-        );
-        return;
-      }
+      if (!/agent/i.test(role)) return;
 
       var name =
         _.get(p, "displayName") ||
         _.get(p, "participant.displayName") ||
         p.name ||
         "An agent";
-
       var operation = (p.operation || p.operationType || "").toLowerCase();
 
-      var text;
-
       if (operation === "add") {
-        text = name + " has joined the conversation.";
+        sawAgentAdd = true;
+        entry.pendingJoinName = name;
       } else if (operation === "remove") {
-        text = name + " has left the conversation.";
-      } else {
-        log(
-          "SSE: participant change with unrecognized operation:",
-          operation,
-          "| raw:",
-          jstr(p),
-        );
-        return;
-      }
-
-      // A warm transfer to another agent fires the exact same
-      // PARTICIPANT_CHANGED(remove) signal as the agent genuinely ending
-      // the chat -- the two are indistinguishable at this point. If this
-      // is an "add", it's the replacement agent showing up: cancel any
-      // pending teardown scheduled by that agent's earlier removal so the
-      // session (and the underlying SSE connection) stays alive.
-      if (operation === "add" && entry.pendingRemovalTimer) {
-        clearTimeout(entry.pendingRemovalTimer);
-        entry.pendingRemovalTimer = null;
-        log(
-          "SSE: replacement agent joined within grace period -> cancelling session teardown for",
-          visitorId,
-        );
-      }
-      entry.agentName = name;
-
-      log("SSE: relaying participant-change message ->", text);
-
-      // Remove any previous custom payload/template
-      delete data.overrideMessagePayload;
-
-      data.message = text;
-
-      _.set(data, "_originalPayload.message", text);
-
-      data.metaTags = {
-        type: operation === "add" ? "agent_joined" : "agent_left",
-        agentName: name,
-      };
-
-      sdk.sendUserMessage(data, function (err) {
-        if (err) {
-          logErr("sendUserMessage (participant-change) failed:", jstr(err));
-        } else {
-          log("SSE: participant-change message delivered to user", visitorId);
-        }
-      });
-
-      // Session cleanup must not depend on whether the "agent has left"
-      // notification to the customer succeeded -- an agent leaving is
-      // authoritative regardless of a transient send failure. Fired
-      // alongside (not nested inside) the notification above, matching the
-      // guarantee this already had before: see CLAUDE.md gotchas for why a
-      // send failure gating cleanup previously caused customers to get
-      // stuck with no bot response after an agent ended the chat.
-      //
-      // Don't tear down immediately, though -- wait AGENT_TRANSFER_GRACE_MS
-      // for a replacement agent's "add" (warm transfer) to cancel this. If
-      // none shows up, this genuinely was the agent ending the chat.
-      if (operation === "remove") {
-        log(
-          "SSE: agent left -> arming",
-          AGENT_TRANSFER_GRACE_MS,
-          "ms grace period before ending session for",
-          visitorId,
-        );
-        if (entry.pendingRemovalTimer) {
-          clearTimeout(entry.pendingRemovalTimer);
-        }
-        entry.pendingRemovalTimer = setTimeout(function () {
-          if (_map[visitorId] !== entry) {
-            return;
-          }
-          entry.pendingRemovalTimer = null;
-          log(
-            "SSE: no replacement agent joined within grace period -> ending session for",
-            visitorId,
-          );
-          endSession(visitorId);
-          clearAgentSessionSafe(visitorId, userDataMap[visitorId] || data);
-        }, AGENT_TRANSFER_GRACE_MS);
+        sawAgentRemove = true;
+        entry.pendingLeaveName = name;
       }
     });
-  } else if (
-    /SESSION_STATUS_CHANGED/i.test(eventName) ||
-    /SessionStatusChanged/i.test(entryType)
-  ) {
+
+    if (sawAgentAdd) {
+      cancelPendingAgentEnd(entry);
+    } else if (sawAgentRemove) {
+      armPendingAgentEnd(visitorId, data, entry, "agent-remove");
+    }
+
+    flushParticipantNotices(visitorId, data, entry);
+    return;
+  }
+
+  if (/SESSION_STATUS_CHANGED/i.test(eventName) || /SessionStatusChanged/i.test(entryType)) {
     var status = String(ep.sessionStatus || "").toUpperCase();
     var endedBy = String(ep.sessionEndedByRole || "").toLowerCase();
-    log(
-      "SSE: session status ->",
-      status,
-      "| endedBy:",
-      endedBy || "(none)",
-      "| visitor",
-      visitorId,
-    );
+    log("SSE: session status ->", status, "| endedBy:", endedBy || "(none)", "| visitor", visitorId);
 
-    if (status !== "ENDED") {
+    if (status === "WAITING" || status === "INACTIVE" || status === "ACTIVE") {
+      cancelPendingAgentEnd(entry);
       return;
     }
 
-    delete data.overrideMessagePayload;
-    data.message = "The agent has ended the chat. This conversation is now closed.";
+    if (status !== "ENDED") return;
 
-    _.set(data, "_originalPayload.message", data.message);
+    if (entry.endingByCustomer || _conversationEnded[visitorId]) {
+      log("SSE ENDED after customer close -> cleanup only");
+      finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
+      return;
+    }
 
-    sdk.sendUserMessage(data, function (err) {
-      if (err) {
-        logErr("sendUserMessage (session ended) failed:", jstr(err));
-      }
-    });
-    _conversationEnded[visitorId] = true;
-    finishLiveAgentHandoff(visitorId, data, "agent-ended-chat");
+    armPendingAgentEnd(visitorId, data, entry, "session-ended");
+    return;
+  }
 
-  } else if (
+  if (
     /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
     /ConversationEnded|CloseConversation/i.test(entryType)
   ) {
-    log(
-      "SSE: conversation closed by Salesforce -> ending session for",
-      visitorId,
-    );
-    finishLiveAgentHandoff(visitorId, data, "sse-close-conversation");
+    log("SSE: conversation closed by Salesforce ->", visitorId);
+    if (entry.endingByCustomer || _conversationEnded[visitorId]) {
+      finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
+      return;
+    }
+    armPendingAgentEnd(visitorId, data, entry, "sse-close");
+    return;
   }
 }
 
@@ -966,6 +1047,15 @@ function endSession(visitorId) {
   }
   if (entry && entry.pendingRemovalTimer) {
     clearTimeout(entry.pendingRemovalTimer);
+    entry.pendingLeaveTimer = null;
+  }
+  if (entry && entry.pendingJoinTimer) {
+    clearTimeout(entry.pendingJoinTimer);
+    entry.pendingJoinTimer = null;
+  }
+  if (entry && entry.sseReconnectTimer) {
+    clearTimeout(entry.sseReconnectTimer);
+    entry.sseReconnectTimer = null;
   }
   delete _map[visitorId];
   delete userDataMap[visitorId];
@@ -1611,6 +1701,16 @@ function handleCustomerEndChat(visitorId, data) {
     "live agent session active -> notifying agent + closing SF session for",
     visitorId,
   );
+
+  entry.endingByCustomer = true;
+  _conversationEnded[visitorId] = true;
+  if (entry.sse) {
+    try {
+      entry.sse.destroy();
+    } catch (e) { /* noop */ }
+    entry.sse = null;
+  }
+
   return api
     .sendMessage(
       entry.accessToken,
@@ -1627,8 +1727,7 @@ function handleCustomerEndChat(visitorId, data) {
       logErr("closeConversation (customer ended chat) failed:", e.message);
     })
     .then(function () {
-      endSession(visitorId);
-      return clearAgentSessionSafe(visitorId, data);
+      return finishLiveAgentHandoff(visitorId, data, "customer-end-chat");
     });
 }
 
@@ -1638,6 +1737,7 @@ function handleCustomerEndChat(visitorId, data) {
 
 function onUserMessage(requestId, data, cb) {
   var visitorId = getVisitorId(data);
+
 
   if (_conversationEnded[visitorId]) {
     log(
@@ -1652,6 +1752,17 @@ function onUserMessage(requestId, data, cb) {
   var entry = _map[visitorId];
   var liveAgent = entry && entry.routed;
   var files = attachments.fromPayload(data);
+
+  if (
+    liveAgent &&
+    String(data.message || "").trim().toUpperCase() === "CUSTOMER_END_CHAT"
+  ) {
+    log("customer end chat (agent session) -> closing Salesforce", visitorId);
+    handleCustomerEndChat(visitorId, data).catch(function (e) {
+      logErr("handleCustomerEndChat failed:", (e && e.message) || e);
+    });
+    return cb(null, data);
+  }
 
   log(
     "on_user_message: visitor",
@@ -1865,101 +1976,39 @@ function onAgentTransfer(requestId, data, cb) {
  * for other client disconnects (not just an explicit end-chat click), this
  * will need narrowing -- see CLAUDE.md.
  */
-// function onEvent(requestId, data, cb) {
-//   var visitorId = getVisitorId(data);
-//   var eventType = _.get(data, "event.eventType");
-//   var resourceId = _.get(data, "resourceid");
-
-//   log(
-//     "on_event:",
-//     "visitor=",
-//     visitorId,
-//     "| eventType=",
-//     eventType,
-//     "| resourceid=",
-//     resourceId,
-//   );
-
-//   if (
-//     eventType === "sessionClosure" ||
-//     resourceId === "/bot.closeConversationSession"
-//   ) {
-
-//     var liveAgent = _map[visitorId] && _map[visitorId].routed;
-//     if (!liveAgent) {
-//       log("sessionClosure ignored (no live agent) for", visitorId);
-//       return cb(null, data);
-//     }
-//     log("Customer end chat with live agent -> closing Salesforce session", visitorId);
-
-
-//     handleCustomerEndChat(visitorId, data).catch(function (e) {
-//       logErr("handleCustomerEndChat failed:", (e && e.message) || e);
-//     });
-//   }
-
-//   return cb(null, data);
-// }
-//------------------------------------------------------------------ */
-function resolveVisitorId(data) {
-  var id =
-    getVisitorId(data) ||
-    _.get(data, "_originalPayload.channel.channelInfos.from") ||
-    _.get(data, "_originalPayload.channel.from") ||
-    _.get(data, "from") ||
-    data.userId;
-  if (id) {
-    return id;
-  }
-  var routedIds = Object.keys(_map).filter(function (k) {
-    return _map[k] && _map[k].routed;
-  });
-  if (routedIds.length === 1) {
-    log("sessionClosure had no channel.from -> using sole live agent visitor", routedIds[0]);
-    return routedIds[0];
-  }
-  log(
-    "sessionClosure visitor unresolved | channel=",
-    jstr(data.channel),
-    "| _map keys=",
-    Object.keys(_map),
-  );
-  return null;
-}
-
 function onEvent(requestId, data, cb) {
-  var visitorId = resolveVisitorId(data);
+  var visitorId = getVisitorId(data);
   var eventType = _.get(data, "event.eventType");
-  var resourceId =
-    _.get(data, "resourceid") ||
-    _.get(data, "_originalPayload.resourceid");
+  var resourceId = _.get(data, "resourceid");
+
   log(
     "on_event:",
-    "visitor=", visitorId,
-    "| eventType=", eventType,
-    "| resourceid=", resourceId,
-    "| event=", jstr(data.event),
+    "visitor=",
+    visitorId,
+    "| eventType=",
+    eventType,
+    "| resourceid=",
+    resourceId,
   );
+
   if (
     eventType === "sessionClosure" ||
-    /closeConversationSession/i.test(String(resourceId || ""))
+    resourceId === "/bot.closeConversationSession"
   ) {
-    var entry = visitorId && _map[visitorId];
-    var liveAgent = entry && entry.routed;
+
+    var liveAgent = _map[visitorId] && _map[visitorId].routed;
     if (!liveAgent) {
-      log(
-        "sessionClosure ignored (no live agent) for",
-        visitorId,
-        "| routed map=",
-        Object.keys(_map).filter(function (k) { return _map[k] && _map[k].routed; }),
-      );
+      log("sessionClosure ignored (no live agent) for", visitorId);
       return cb(null, data);
     }
     log("Customer end chat with live agent -> closing Salesforce session", visitorId);
+
+
     handleCustomerEndChat(visitorId, data).catch(function (e) {
       logErr("handleCustomerEndChat failed:", (e && e.message) || e);
     });
   }
+
   return cb(null, data);
 }
 
