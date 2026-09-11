@@ -83,9 +83,10 @@
         },
         "inactivity": {
             "_comment": "Auto-create a deflected case when a customer stops responding without explicitly ending the chat.",
-            "enabled": false,
-            "timeoutMs": 900000,
+            "enabled": true,
+            "timeoutMs": 240000,
             "endedReplyMessage": "This conversation has ended. Please start a new chat if you need further help.",
+            "timeoutCloseMessage": "This conversation has been closed. Please click the X button to close the chat. You can click the Chat bubble icon anytime to start a new conversation.",
             "nudges": [
                 {
                     "enabled": true,
@@ -99,7 +100,7 @@
                 },
                 {
                     "enabled": true,
-                    "delayMs": 540000,
+                    "delayMs": 180000,
                     "message": "We’ll be ending your session soon if there are no further questions or requests. Please let us know if you need any additional assistance."
                 }
             ]

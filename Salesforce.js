@@ -82,6 +82,11 @@ var ENDED_REPLY_MESSAGE = _.get(
   "inactivity.endedReplyMessage",
   "This conversation has ended. Please start a new chat if you need further help.",
 );
+var INACTIVITY_TIMEOUT_MESSAGE = _.get(
+  SF,
+  "inactivity.timeoutCloseMessage",
+  "This conversation has been closed. Please click the X button to close the chat. You can click the Chat bubble icon anytime to start a new conversation.",
+);
 
 /* ------------------------------------------------------------------ */
 /* logging helpers                                                     */
@@ -750,60 +755,46 @@ function handleSseEvent(visitorId, block) {
     _.get(entry2, "sender.role") || _.get(payload, "sender.role") || "";
   var entryType = ep.entryType || entry2.entryType || "";
 
-  // var alreadyEnded = !!(entry.endingByCustomer || _conversationEnded[visitorId]);
-  // if (alreadyEnded) {
-  //   if (
-  //     /SESSION_STATUS_CHANGED/i.test(eventName) ||
-  //     /SessionStatusChanged/i.test(entryType) ||
-  //     /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
-  //     /ConversationEnded|CloseConversation/i.test(entryType)
-  //   ) {
-  //     finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
-  //   } else {
-  //     log("SSE after customer end -> skip", eventName, visitorId);
-  //   }
-  //   return;
-  // }
 
   var senderRole =
-  _.get(entry2, "sender.role") || _.get(payload, "sender.role") || "";
-var entryType = ep.entryType || entry2.entryType || "";
+    _.get(entry2, "sender.role") || _.get(payload, "sender.role") || "";
+  var entryType = ep.entryType || entry2.entryType || "";
 
-// Capture BEFORE alreadyEnded/typing returns. Yes sets _conversationEnded
-// first, then opens SSE + pushes history; those echoes still carry the
-// MessagingSession Id and must not be discarded.
-var relatedRecords = _.get(entry2, "relatedRecords");
-if (
-  !entry.messagingSessionId &&
-  _.isArray(relatedRecords) &&
-  relatedRecords.length
-) {
-  var candidate = relatedRecords[0];
-  if (typeof candidate === "string" && candidate.indexOf("0Mw") === 0) {
-    entry.messagingSessionId = candidate;
-    log(
-      "SSE: captured Salesforce MessagingSession record Id ->",
-      entry.messagingSessionId,
-      "for",
-      visitorId,
-    );
-  }
-}
-
-var alreadyEnded = !!(entry.endingByCustomer || _conversationEnded[visitorId]);
-if (alreadyEnded) {
+  // Capture BEFORE alreadyEnded/typing returns. Yes sets _conversationEnded
+  // first, then opens SSE + pushes history; those echoes still carry the
+  // MessagingSession Id and must not be discarded.
+  var relatedRecords = _.get(entry2, "relatedRecords");
   if (
-    /SESSION_STATUS_CHANGED/i.test(eventName) ||
-    /SessionStatusChanged/i.test(entryType) ||
-    /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
-    /ConversationEnded|CloseConversation/i.test(entryType)
+    !entry.messagingSessionId &&
+    _.isArray(relatedRecords) &&
+    relatedRecords.length
   ) {
-    finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
-  } else {
-    log("SSE after customer end -> skip", eventName, visitorId);
+    var candidate = relatedRecords[0];
+    if (typeof candidate === "string" && candidate.indexOf("0Mw") === 0) {
+      entry.messagingSessionId = candidate;
+      log(
+        "SSE: captured Salesforce MessagingSession record Id ->",
+        entry.messagingSessionId,
+        "for",
+        visitorId,
+      );
+    }
   }
-  return;
-}
+
+  var alreadyEnded = !!(entry.endingByCustomer || _conversationEnded[visitorId]);
+  if (alreadyEnded) {
+    if (
+      /SESSION_STATUS_CHANGED/i.test(eventName) ||
+      /SessionStatusChanged/i.test(entryType) ||
+      /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
+      /ConversationEnded|CloseConversation/i.test(entryType)
+    ) {
+      finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
+    } else {
+      log("SSE after customer end -> skip", eventName, visitorId);
+    }
+    return;
+  }
 
 
   // ---------------------------------------------------------------
@@ -888,27 +879,7 @@ if (alreadyEnded) {
     return;
   }
 
-  // MIAW's createConversation response has no body -- the only way to learn
-  // the actual Salesforce MessagingSession record Id (which the Kore Create
-  // Case endpoint requires as messaging_session_id, NOT our client-generated
-  // conversationId UUID) is to read it off a conversationEntry's
-  // relatedRecords once real traffic (e.g. the history push) flows through.
-  // Captured once, as a side effect, regardless of event type.
-  // var relatedRecords = _.get(entry2, "relatedRecords");
-  // if (
-  //   !entry.messagingSessionId &&
-  //   _.isArray(relatedRecords) &&
-  //   relatedRecords.length
-  // ) {
-  //   entry.messagingSessionId = relatedRecords[0];
-  //   log(
-  //     "SSE: captured Salesforce MessagingSession record Id ->",
-  //     entry.messagingSessionId,
-  //     "for",
-  //     visitorId,
-  //   );
-  // }
-// -------------------------------
+  // -------------------------------
   // Informational only: the Case + routing trigger now happen synchronously
   // in createSalesforceSession() (submitCase) BEFORE the SSE relay is even
   // started, via the Kore Create Case endpoint's session_should_be_routed
@@ -1572,6 +1543,47 @@ function sendInactivityNudge(visitorId, nudge, stepKey) {
   });
 }
 
+function closeIdleConversation(visitorId, data) {
+  if (_conversationEnded[visitorId]) {
+    return;
+  }
+  if (_map[visitorId] && _map[visitorId].routed) {
+    return;
+  }
+  // Set this first so a widget sessionClosure cannot create a second case.
+  _conversationEnded[visitorId] = true;
+  disarmInactivityTimer(visitorId);
+
+  var payload = data ? _.assign({}, data) : null;
+  if (payload) {
+    payload.message = INACTIVITY_TIMEOUT_MESSAGE;
+    delete payload.overrideMessagePayload;
+  }
+
+  log(
+    "inactivity timeout (" + INACTIVITY_TIMEOUT_MS + "ms) -> closing session, Assumed Deflection for",
+    visitorId,
+  );
+
+  function finish() {
+    return createDeflectedCase(visitorId, data, "Assumed Deflection").then(
+      function () {
+        return payload ? closeWebSdkSession(payload) : Promise.resolve();
+      },
+    );
+  }
+
+  if (!payload) {
+    return finish();
+  }
+  sdk.sendUserMessage(payload, function (err) {
+    if (err) {
+      logErr("inactivity close message failed:", jstr(err));
+    }
+    finish();
+  });
+}
+
 
 function noteActivity(visitorId, data) {
   if (_map[visitorId] && _map[visitorId].routed) {
@@ -1603,15 +1615,23 @@ function noteActivity(visitorId, data) {
       sendInactivityNudge(visitorId, nudge, stepKey);
     }, nudge.delayMs);
   });
+  // if (INACTIVITY_ENABLED) {
+  //   entry.timer = setTimeout(function () {
+  //     log(
+  //       "inactivity timeout (" +
+  //       INACTIVITY_TIMEOUT_MS +
+  //       "ms) -> creating deflected case for",
+  //       visitorId,
+  //     );
+  //     createDeflectedCase(visitorId, entry.data, "Assumed Deflection");
+  //   }, INACTIVITY_TIMEOUT_MS);
+  // }
   if (INACTIVITY_ENABLED) {
     entry.timer = setTimeout(function () {
-      log(
-        "inactivity timeout (" +
-        INACTIVITY_TIMEOUT_MS +
-        "ms) -> creating deflected case for",
-        visitorId,
-      );
-      createDeflectedCase(visitorId, entry.data, "Assumed Deflection");
+      if (_activity[visitorId] !== entry) {
+        return;
+      }
+      closeIdleConversation(visitorId, entry.data);
     }, INACTIVITY_TIMEOUT_MS);
   }
   _activity[visitorId] = entry;
