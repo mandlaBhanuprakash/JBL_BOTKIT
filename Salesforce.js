@@ -1996,12 +1996,12 @@ function onEvent(requestId, data, cb) {
     resourceId === "/bot.closeConversationSession"
   ) {
 
-    var liveAgent = _map[visitorId] && _map[visitorId].routed;
-    if (!liveAgent) {
-      log("sessionClosure ignored (no live agent) for", visitorId);
-      return cb(null, data);
-    }
-    log("Customer end chat with live agent -> closing Salesforce session", visitorId);
+    // var liveAgent = _map[visitorId] && _map[visitorId].routed;
+    // if (!liveAgent) {
+    //   log("sessionClosure ignored (no live agent) for", visitorId);
+    //   return cb(null, data);
+    // }
+    // log("Customer end chat with live agent -> closing Salesforce session", visitorId);
 
 
     handleCustomerEndChat(visitorId, data).catch(function (e) {

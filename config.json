@@ -89,7 +89,7 @@
             "nudges": [
                 {
                     "enabled": true,
-                    "delayMs": 180000,
+                    "delayMs": 90000,
                     "message": "Were you able to get what you needed?",
                     "confirmClosure": true,
                     "closingMessage": "Thank you! I'm glad I could help. This conversation is now closed.",
