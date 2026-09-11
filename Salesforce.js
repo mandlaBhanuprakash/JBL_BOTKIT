@@ -750,20 +750,61 @@ function handleSseEvent(visitorId, block) {
     _.get(entry2, "sender.role") || _.get(payload, "sender.role") || "";
   var entryType = ep.entryType || entry2.entryType || "";
 
-  var alreadyEnded = !!(entry.endingByCustomer || _conversationEnded[visitorId]);
-  if (alreadyEnded) {
-    if (
-      /SESSION_STATUS_CHANGED/i.test(eventName) ||
-      /SessionStatusChanged/i.test(entryType) ||
-      /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
-      /ConversationEnded|CloseConversation/i.test(entryType)
-    ) {
-      finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
-    } else {
-      log("SSE after customer end -> skip", eventName, visitorId);
-    }
-    return;
+  // var alreadyEnded = !!(entry.endingByCustomer || _conversationEnded[visitorId]);
+  // if (alreadyEnded) {
+  //   if (
+  //     /SESSION_STATUS_CHANGED/i.test(eventName) ||
+  //     /SessionStatusChanged/i.test(entryType) ||
+  //     /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
+  //     /ConversationEnded|CloseConversation/i.test(entryType)
+  //   ) {
+  //     finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
+  //   } else {
+  //     log("SSE after customer end -> skip", eventName, visitorId);
+  //   }
+  //   return;
+  // }
+
+  var senderRole =
+  _.get(entry2, "sender.role") || _.get(payload, "sender.role") || "";
+var entryType = ep.entryType || entry2.entryType || "";
+
+// Capture BEFORE alreadyEnded/typing returns. Yes sets _conversationEnded
+// first, then opens SSE + pushes history; those echoes still carry the
+// MessagingSession Id and must not be discarded.
+var relatedRecords = _.get(entry2, "relatedRecords");
+if (
+  !entry.messagingSessionId &&
+  _.isArray(relatedRecords) &&
+  relatedRecords.length
+) {
+  var candidate = relatedRecords[0];
+  if (typeof candidate === "string" && candidate.indexOf("0Mw") === 0) {
+    entry.messagingSessionId = candidate;
+    log(
+      "SSE: captured Salesforce MessagingSession record Id ->",
+      entry.messagingSessionId,
+      "for",
+      visitorId,
+    );
   }
+}
+
+var alreadyEnded = !!(entry.endingByCustomer || _conversationEnded[visitorId]);
+if (alreadyEnded) {
+  if (
+    /SESSION_STATUS_CHANGED/i.test(eventName) ||
+    /SessionStatusChanged/i.test(entryType) ||
+    /CLOSE_CONVERSATION|CONVERSATION_CLOSED/i.test(eventName) ||
+    /ConversationEnded|CloseConversation/i.test(entryType)
+  ) {
+    finishLiveAgentHandoff(visitorId, data, "sse-echo-after-customer-close");
+  } else {
+    log("SSE after customer end -> skip", eventName, visitorId);
+  }
+  return;
+}
+
 
   // ---------------------------------------------------------------
   // AGENT TYPING STARTED
@@ -853,21 +894,21 @@ function handleSseEvent(visitorId, block) {
   // conversationId UUID) is to read it off a conversationEntry's
   // relatedRecords once real traffic (e.g. the history push) flows through.
   // Captured once, as a side effect, regardless of event type.
-  var relatedRecords = _.get(entry2, "relatedRecords");
-  if (
-    !entry.messagingSessionId &&
-    _.isArray(relatedRecords) &&
-    relatedRecords.length
-  ) {
-    entry.messagingSessionId = relatedRecords[0];
-    log(
-      "SSE: captured Salesforce MessagingSession record Id ->",
-      entry.messagingSessionId,
-      "for",
-      visitorId,
-    );
-  }
-
+  // var relatedRecords = _.get(entry2, "relatedRecords");
+  // if (
+  //   !entry.messagingSessionId &&
+  //   _.isArray(relatedRecords) &&
+  //   relatedRecords.length
+  // ) {
+  //   entry.messagingSessionId = relatedRecords[0];
+  //   log(
+  //     "SSE: captured Salesforce MessagingSession record Id ->",
+  //     entry.messagingSessionId,
+  //     "for",
+  //     visitorId,
+  //   );
+  // }
+// -------------------------------
   // Informational only: the Case + routing trigger now happen synchronously
   // in createSalesforceSession() (submitCase) BEFORE the SSE relay is even
   // started, via the Kore Create Case endpoint's session_should_be_routed
@@ -2001,7 +2042,7 @@ function onEvent(requestId, data, cb) {
     //   log("sessionClosure ignored (no live agent) for", visitorId);
     //   return cb(null, data);
     // }
-    // log("Customer end chat with live agent -> closing Salesforce session", visitorId);
+    log("Customer end chat with live agent -> closing Salesforce session", visitorId);
 
 
     handleCustomerEndChat(visitorId, data).catch(function (e) {
