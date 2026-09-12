@@ -53,7 +53,7 @@ var userDataMap = {};
 //   _activity[visitorId] = { data, timer }
 var _activity = {};
 var INACTIVITY_ENABLED = _.get(SF, "inactivity.enabled", true);
-var INACTIVITY_TIMEOUT_MS = _.get(SF, "inactivity.timeoutMs", 15 * 60 * 1000);
+var INACTIVITY_TIMEOUT_MS = _.get(SF, "inactivity.timeoutMs", 10 * 60 * 1000);
 var INACTIVITY_NUDGES = (_.get(SF, "inactivity.nudges") || []).filter(function (
   nudge,
 ) {
@@ -1564,9 +1564,12 @@ function closeIdleConversation(visitorId, data) {
     "inactivity timeout (" + INACTIVITY_TIMEOUT_MS + "ms) -> closing session, Assumed Deflection for",
     visitorId,
   );
+  var status = deflectionStatus || "Assumed Deflection";
+  log("closing session ->", status, "for", visitorId);
+
 
   function finish() {
-    return createDeflectedCase(visitorId, data, "Assumed Deflection").then(
+    return createDeflectedCase(visitorId, data, status).then(
       function () {
         return payload ? closeWebSdkSession(payload) : Promise.resolve();
       },
@@ -1680,7 +1683,7 @@ function armPostNoDeflectionTimer(visitorId, data, nudge) {
       "case for",
       visitorId,
     );
-    createDeflectedCase(visitorId, entry.data, status);
+    closeIdleConversation(visitorId, entry.data, status);
   }, delayMs);
   _activity[visitorId] = entry;
 }

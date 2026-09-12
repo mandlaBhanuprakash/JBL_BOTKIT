@@ -95,7 +95,7 @@
                     "confirmClosure": true,
                     "closingMessage": "Thank you! I'm glad I could help. This conversation is now closed.",
                     "continueMessage": "Let me know if you have any other queries",
-                    "noResponseTimeoutMs": 600000,
+                    "noResponseTimeoutMs": 180000,
                     "noResponseDeflectionStatus": "Not deflected"
                 },
                 {
