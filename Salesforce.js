@@ -1543,7 +1543,7 @@ function sendInactivityNudge(visitorId, nudge, stepKey) {
   });
 }
 
-function closeIdleConversation(visitorId, data) {
+function closeIdleConversation(visitorId, data,deflectionStatus) {
   if (_conversationEnded[visitorId]) {
     return;
   }
